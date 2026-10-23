@@ -441,7 +441,7 @@ struct PriceChart: View {
                 if let i = hov {
                     tooltip(slots[i])
                         .fixedSize()
-                        .position(x: min(max(x(for: i, width: w), 64), max(w - 64, 64)), y: 26)
+                        .position(x: min(max(xMid(for: i, width: w), 64), max(w - 64, 64)), y: 26)
                 }
             }
             .contentShape(Rectangle())
@@ -459,6 +459,13 @@ struct PriceChart: View {
     private func x(for i: Int, width: CGFloat) -> CGFloat {
         let plotW = max(1, width - padLeft - padRight)
         return padLeft + plotW * CGFloat(i) / CGFloat(max(slots.count - 1, 1))
+    }
+
+    /// Mitte der Stufe für Slot i (dort liegt der Punkt auf der Treppe).
+    private func xMid(for i: Int, width: CGFloat) -> CGFloat {
+        let a = x(for: i, width: width)
+        guard i < slots.count - 1 else { return a }
+        return (a + x(for: i + 1, width: width)) / 2
     }
 
     private func hoverIndex(width: CGFloat) -> Int? {
@@ -540,24 +547,23 @@ struct PriceChart: View {
         let span = max(hi - lo, 0.0001)
         func tint(_ v: Double) -> Color { priceColor((v - lo) / span) }
 
-        // Fläche pro Segment, Farbe nach relativer Lage
+        // Treppe: Säule pro Viertelstunde, Wert konstant bis zum nächsten Slot
         for i in 1..<slots.count {
-            let fill = tint(vals[i])
-            var area = Path()
-            area.move(to: CGPoint(x: px(i - 1), y: base))
-            area.addLine(to: CGPoint(x: px(i - 1), y: py(vals[i - 1])))
-            area.addLine(to: CGPoint(x: px(i), y: py(vals[i])))
-            area.addLine(to: CGPoint(x: px(i), y: base))
-            area.closeSubpath()
-            ctx.fill(area, with: .color(fill.opacity(0.20)))
-        }
-        // Linie pro Segment
-        for i in 1..<slots.count {
-            var line = Path()
-            line.move(to: CGPoint(x: px(i - 1), y: py(vals[i - 1])))
-            line.addLine(to: CGPoint(x: px(i), y: py(vals[i])))
-            ctx.stroke(line, with: .color(tint(vals[i])),
-                       style: StrokeStyle(lineWidth: 1.8, lineCap: .round))
+            let c = tint(vals[i - 1])
+            var column = Path()
+            column.move(to: CGPoint(x: px(i - 1), y: base))
+            column.addLine(to: CGPoint(x: px(i - 1), y: py(vals[i - 1])))
+            column.addLine(to: CGPoint(x: px(i), y: py(vals[i - 1])))
+            column.addLine(to: CGPoint(x: px(i), y: base))
+            column.closeSubpath()
+            ctx.fill(column, with: .color(c.opacity(0.20)))
+
+            var step = Path()
+            step.move(to: CGPoint(x: px(i - 1), y: py(vals[i - 1])))
+            step.addLine(to: CGPoint(x: px(i), y: py(vals[i - 1])))
+            step.addLine(to: CGPoint(x: px(i), y: py(vals[i])))
+            ctx.stroke(step, with: .color(c),
+                       style: StrokeStyle(lineWidth: 1.6, lineCap: .butt, lineJoin: .miter))
         }
 
         // Jetzt-Markierung (gestrichelt)
@@ -582,7 +588,7 @@ struct PriceChart: View {
 
         // Hover-Markierung
         if let i = hover {
-            let hx = px(i)
+            let hx = i < slots.count - 1 ? (px(i) + px(i + 1)) / 2 : px(i)
             var vline = Path()
             vline.move(to: CGPoint(x: hx, y: padTop))
             vline.addLine(to: CGPoint(x: hx, y: base))
@@ -810,8 +816,10 @@ struct ContentView: View {
                 PriceChart(slots: store.chartSlots, currency: store.currency,
                            now: store.now, slotSeconds: store.hourly ? 3600 : store.slotSeconds)
                     .frame(height: 150)
+                    .overlay(alignment: .topLeading) {
+                        Text("cent").font(.system(size: 9)).foregroundColor(Palette.faint)
+                    }
                 HStack(spacing: 4) {
-                    Text("cent").font(.system(size: 9)).foregroundColor(Palette.faint)
                     Spacer()
                     if let c = store.currentSlot {
                         Text("\(levelLabel(store.position(c.total))) · \(priceString(c.total, store.currency))")
