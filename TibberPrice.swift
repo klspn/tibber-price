@@ -1,0 +1,972 @@
+// TibberPrice – Preis pro Viertelstunde in der Menüleiste.
+// Daten: Tibber GraphQL, priceInfo(resolution: QUARTER_HOURLY).
+import SwiftUI
+import Security
+import LocalAuthentication
+
+// MARK: - Modell
+
+struct Slot: Identifiable, Equatable {
+    let id: Date
+    let total: Double
+    let level: String
+}
+
+enum ISO {
+    nonisolated(unsafe) static let frac: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+    nonisolated(unsafe) static let plain: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime]
+        return f
+    }()
+}
+
+// MARK: - Aussehen (angelehnt an die Tibber-App)
+
+enum Palette {
+    static let bg = Color(red: 0.043, green: 0.043, blue: 0.051)
+    static let pill = Color(white: 0.16)
+    static let cheap = Color(red: 0.30, green: 0.85, blue: 0.76)
+    static let expensive = Color(red: 0.94, green: 0.55, blue: 0.16)
+    static let veryExpensive = Color(red: 0.93, green: 0.36, blue: 0.16)
+    static let text = Color(white: 0.95)
+    static let dim = Color(white: 0.62)
+    static let faint = Color(white: 0.38)
+}
+
+// Farbe nach relativer Lage im sichtbaren Zeitraum: türkis = günstig, orange/rot = teuer.
+// Nicht das `level` der API nutzen: das ist bei Viertelstundenwerten inkonsistent.
+func priceColor(_ t: Double) -> Color {
+    let x = min(max(t, 0), 1)
+    if x <= 0.40 { return Palette.cheap }
+    if x <= 0.75 { return lerp(Palette.cheap, Palette.expensive, (x - 0.40) / 0.35) }
+    return lerp(Palette.expensive, Palette.veryExpensive, (x - 0.75) / 0.25)
+}
+
+func lerp(_ a: Color, _ b: Color, _ t: Double) -> Color {
+    guard let ca = NSColor(a).usingColorSpace(.sRGB),
+          let cb = NSColor(b).usingColorSpace(.sRGB) else { return a }
+    let k = CGFloat(min(max(t, 0), 1))
+    return Color(.sRGB,
+                 red: ca.redComponent + (cb.redComponent - ca.redComponent) * k,
+                 green: ca.greenComponent + (cb.greenComponent - ca.greenComponent) * k,
+                 blue: ca.blueComponent + (cb.blueComponent - ca.blueComponent) * k,
+                 opacity: 1)
+}
+
+func levelLabel(_ t: Double) -> String {
+    t <= 0.33 ? "günstig" : t <= 0.70 ? "normal" : "teuer"
+}
+
+func priceString(_ total: Double, _ currency: String) -> String {
+    let s: String
+    if currency == "EUR" {
+        s = String(format: "%.1f", total * 100) + " ct"
+    } else {
+        s = String(format: "%.3f", total) + " " + currency
+    }
+    return s.replacingOccurrences(of: ".", with: ",")
+}
+
+/// Zahl ohne Einheit, für die große Anzeige im Ring.
+func amountString(_ total: Double, _ currency: String) -> String {
+    let v = currency == "EUR" ? total * 100 : total
+    return String(format: currency == "EUR" ? "%.1f" : "%.3f", v)
+        .replacingOccurrences(of: ".", with: ",")
+}
+
+func unitString(_ currency: String) -> String { currency == "EUR" ? "ct" : currency }
+
+func pickCurrent(in slots: [Slot], at now: Date) -> Slot? {
+    slots.last { $0.id <= now } ?? slots.first
+}
+
+// MARK: - API
+
+private struct Envelope: Decodable {
+    let data: Payload?
+    let errors: [GQLError]?
+}
+private struct GQLError: Decodable { let message: String }
+private struct Payload: Decodable { let viewer: Viewer }
+private struct Viewer: Decodable { let homes: [Home] }
+private struct Home: Decodable { let currentSubscription: Sub? }
+private struct Sub: Decodable { let priceInfo: PriceInfo }
+private struct PriceInfo: Decodable {
+    let current: RawPrice?
+    let today: [RawPrice]
+    let tomorrow: [RawPrice]
+}
+private struct RawPrice: Decodable {
+    let total: Double
+    let startsAt: String
+    let level: String?
+    let currency: String?
+}
+
+enum AppError: LocalizedError {
+    case msg(String)
+    var errorDescription: String? {
+        switch self { case .msg(let m): return m }
+    }
+}
+
+enum GraphQL {
+    static let endpoint = URL(string: "https://api.tibber.com/v1-beta/gql")!
+    static let query = """
+    query {
+      viewer {
+        homes {
+          currentSubscription {
+            priceInfo(resolution: QUARTER_HOURLY) {
+              current { total startsAt level currency }
+              today { total startsAt level currency }
+              tomorrow { total startsAt level currency }
+            }
+          }
+        }
+      }
+    }
+    """
+
+    static func parse(_ data: Data) throws -> (slots: [Slot], currency: String) {
+        let env = try JSONDecoder().decode(Envelope.self, from: data)
+        if let e = env.errors?.first { throw AppError.msg(e.message) }
+        guard let info = env.data?.viewer.homes.first?.currentSubscription?.priceInfo else {
+            throw AppError.msg("Keine Preisdaten in der Antwort")
+        }
+        var byDate: [Date: Slot] = [:]
+        for p in info.today + info.tomorrow {
+            guard let d = ISO.frac.date(from: p.startsAt) ?? ISO.plain.date(from: p.startsAt) else { continue }
+            byDate[d] = Slot(id: d, total: p.total, level: p.level ?? "NORMAL")
+        }
+        let slots = byDate.values.sorted { $0.id < $1.id }
+        let currency = info.current?.currency ?? info.today.first?.currency ?? "EUR"
+        return (slots, currency)
+    }
+}
+
+// MARK: - Keychain
+
+enum Keychain {
+    static let service = "de.klspn.TibberPrice"
+    static let account = "tibber-token"
+
+    private static var base: [String: Any] {
+        [kSecClass as String: kSecClassGenericPassword,
+         kSecAttrService as String: service,
+         kSecAttrAccount as String: account]
+    }
+
+    static func load() -> String? {
+        var q = base
+        q[kSecReturnData as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: CFTypeRef?
+        guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
+              let data = out as? Data,
+              let s = String(data: data, encoding: .utf8),
+              !s.isEmpty else { return nil }
+        return s
+    }
+
+    static func save(_ token: String) {
+        delete()
+        var q = base
+        q[kSecValueData as String] = Data(token.utf8)
+        SecItemAdd(q as CFDictionary, nil)
+    }
+
+    static func delete() {
+        SecItemDelete(base as CFDictionary)
+    }
+}
+
+// MARK: - Touch ID
+
+enum Auth {
+    /// Einmal pro App-Start. Macs ohne Biometrie fallen auf das Login-Passwort zurück.
+    @MainActor static func require() async -> Bool {
+        let ctx = LAContext()
+        ctx.localizedFallbackTitle = "Passwort verwenden"
+        var err: NSError?
+        guard ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) else { return true }
+        NSApp.activate(ignoringOtherApps: true)
+        return (try? await ctx.evaluatePolicy(.deviceOwnerAuthentication,
+                                             localizedReason: "Tibber-Preise freigeben")) ?? false
+    }
+}
+
+// MARK: - Store
+
+@MainActor
+final class Store: ObservableObject {
+    @Published var slots: [Slot] = []
+    @Published var currency = "EUR"
+    @Published var status: String? = nil          // Fehlertext
+    @Published var loading = false
+    @Published var needsToken = false
+    @Published var updated: Date? = nil
+    @Published var selectedDay: Date? = nil
+    @Published var span2 = false                  // Heute/Morgen vs. 2 Tage
+    @Published var hourly = false                 // 60-Minuten-Ansicht
+    @Published var now = Date()
+    @Published var locked = false
+
+    private var loop: Task<Void, Never>?
+    private var token: String?
+
+    /// authenticate: false nur für --preview (Layout ohne Keychain/Touch ID rendern).
+    init(authenticate: Bool = true) {
+        if authenticate {
+            Task { await bootstrap() }
+        } else {
+            loadCache()
+        }
+    }
+
+    private func bootstrap() async {
+        // kurz warten, bis die Menüleisten-App läuft – sonst kann der Systemdialog nicht erscheinen
+        try? await Task.sleep(for: .milliseconds(400))
+        guard await Auth.require() else { locked = true; return }
+        locked = false
+        // Token genau einmal pro Start lesen, danach nur noch aus dem Speicher.
+        token = Keychain.load()
+        needsToken = token == nil
+        guard !needsToken else { return }
+        loadCache()
+        startLoop()
+        if !cacheUsable { await refresh() }
+    }
+
+    func unlock() async {
+        await bootstrap()
+    }
+
+    // MARK: abgeleitet
+
+    var currentSlot: Slot? { pickCurrent(in: slots, at: now) }
+
+    var days: [Date] {
+        Set(slots.map { Calendar.current.startOfDay(for: $0.id) }).sorted()
+    }
+
+    var activeDay: Date {
+        let ds = days
+        let today = Calendar.current.startOfDay(for: now)
+        if let s = selectedDay, ds.contains(s) { return s }
+        return ds.contains(today) ? today : (ds.first ?? today)
+    }
+
+    func slots(on day: Date) -> [Slot] {
+        slots.filter { Calendar.current.isDate($0.id, inSameDayAs: day) }
+    }
+
+    var activeSlots: [Slot] { slots(on: activeDay) }
+
+    /// Sichtbarer Zeitraum: ein Tag oder zwei Tage ab dem gewählten Tag.
+    var visibleSlots: [Slot] {
+        let start = Calendar.current.startOfDay(for: activeDay)
+        guard let end = Calendar.current.date(byAdding: .day, value: span2 ? 2 : 1, to: start) else {
+            return activeSlots
+        }
+        return slots.filter { $0.id >= start && $0.id < end }
+    }
+
+    /// Was der Chart zeichnet: 15-Minuten-Werte oder zu Stunden gemittelt.
+    var chartSlots: [Slot] {
+        hourly ? Store.hourly(visibleSlots) : visibleSlots
+    }
+
+    /// 0 = günstigster Slot im sichtbaren Zeitraum, 1 = teuerster.
+    func position(_ value: Double) -> Double {
+        let v = visibleSlots.map(\.total)
+        guard let lo = v.min(), let hi = v.max(), hi > lo else { return 0.5 }
+        return (value - lo) / (hi - lo)
+    }
+
+    var visibleAverage: Double {
+        let v = visibleSlots
+        guard !v.isEmpty else { return 0 }
+        return v.map(\.total).reduce(0, +) / Double(v.count)
+    }
+
+    var slotSeconds: TimeInterval {
+        guard slots.count > 1 else { return 900 }
+        return slots[1].id.timeIntervalSince(slots[0].id)
+    }
+
+    func dayLabel(_ d: Date) -> String {
+        let today = Calendar.current.startOfDay(for: now)
+        if d == today { return "Heute" }
+        if d == Calendar.current.date(byAdding: .day, value: 1, to: today) { return "Morgen" }
+        return d.formatted(.dateTime.weekday(.abbreviated).day().month())
+    }
+
+    static func hourly(_ input: [Slot]) -> [Slot] {
+        var out: [Slot] = []
+        var bucket: [Slot] = []
+        let cal = Calendar.current
+        func flush() {
+            guard let first = bucket.first else { return }
+            let avg = bucket.map(\.total).reduce(0, +) / Double(bucket.count)
+            let level = bucket.max { $0.total < $1.total }?.level ?? first.level
+            out.append(Slot(id: first.id, total: avg, level: level))
+            bucket = []
+        }
+        for s in input {
+            if let first = bucket.first,
+               cal.component(.hour, from: first.id) != cal.component(.hour, from: s.id)
+                || !cal.isDate(first.id, inSameDayAs: s.id) {
+                flush()
+            }
+            bucket.append(s)
+        }
+        flush()
+        return out
+    }
+
+    // MARK: Cache
+
+    static var cacheURL: URL {
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("TibberPrice", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("cache.json")
+    }
+
+    private var cacheUsable: Bool {
+        guard !slots.isEmpty else { return false }
+        guard let m = (try? FileManager.default.attributesOfItem(atPath: Self.cacheURL.path))?[.modificationDate] as? Date else {
+            return false
+        }
+        // Preise ändern sich 1x/Tag; 6 h Cache reicht und schont das Rate-Limit.
+        return now.timeIntervalSince(m) < 6 * 3600 && slots.contains { $0.id > now.addingTimeInterval(3600) }
+    }
+
+    private func loadCache() {
+        guard let data = try? Data(contentsOf: Self.cacheURL),
+              let (s, c) = try? GraphQL.parse(data) else { return }
+        slots = s
+        currency = c
+        updated = (try? FileManager.default.attributesOfItem(atPath: Self.cacheURL.path))?[.modificationDate] as? Date
+    }
+
+    // MARK: Netz
+
+    func refresh() async {
+        guard let t = token else { needsToken = true; return }
+        loading = true
+        status = nil
+        defer { loading = false }
+        do {
+            var req = URLRequest(url: GraphQL.endpoint, timeoutInterval: 20)
+            req.httpMethod = "POST"
+            req.setValue("Bearer \(t)", forHTTPHeaderField: "Authorization")
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue("TibberPrice/1.0 (macOS)", forHTTPHeaderField: "User-Agent")
+            req.httpBody = try JSONEncoder().encode(["query": GraphQL.query])
+            let (data, resp) = try await URLSession.shared.data(for: req)
+            let code = (resp as? HTTPURLResponse)?.statusCode ?? 0
+            if code == 429 { throw AppError.msg("Rate-Limit (429) – bitte später erneut") }
+            if code == 401 || code == 403 { throw AppError.msg("Token ungültig – unten „Token“") }
+            guard code == 200 else { throw AppError.msg("HTTP \(code)") }
+            let (s, c) = try GraphQL.parse(data)
+            guard !s.isEmpty else { throw AppError.msg("Keine Preise erhalten") }
+            slots = s
+            currency = c
+            updated = Date()
+            needsToken = false
+            try? data.write(to: Self.cacheURL)
+        } catch {
+            status = error.localizedDescription
+        }
+    }
+
+    func saveToken(_ raw: String) {
+        let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !t.isEmpty else { return }
+        Keychain.save(t)
+        token = t
+        needsToken = false
+        startLoop()
+        Task { await refresh() }
+    }
+
+    // MARK: Takt
+
+    private func startLoop() {
+        loop?.cancel()
+        loop = Task { [weak self] in
+            while !Task.isCancelled {
+                let n = Date()
+                let step = 15 * 60.0
+                let next = (floor(n.timeIntervalSince1970 / step) + 1) * step + 2
+                try? await Task.sleep(for: .seconds(max(1, next - n.timeIntervalSince1970)))
+                guard let self, !Task.isCancelled else { return }
+                self.now = Date()
+                if !self.cacheUsable { await self.refresh() }
+            }
+        }
+    }
+}
+
+// MARK: - Chart
+
+struct PriceChart: View {
+    let slots: [Slot]
+    let currency: String
+    let now: Date
+    let slotSeconds: TimeInterval
+
+    @State private var hoverX: CGFloat?
+
+    private let padLeft: CGFloat = 22
+    private let padRight: CGFloat = 4
+    private let padTop: CGFloat = 8
+    private let padBottom: CGFloat = 16
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let hov = hoverIndex(width: w)
+            ZStack(alignment: .topLeading) {
+                Canvas { ctx, size in
+                    draw(&ctx, size: size, hover: hov)
+                }
+                if let i = hov {
+                    tooltip(slots[i])
+                        .fixedSize()
+                        .position(x: min(max(x(for: i, width: w), 64), max(w - 64, 64)), y: 26)
+                }
+            }
+            .contentShape(Rectangle())
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let p): hoverX = p.x
+                case .ended: hoverX = nil
+                }
+            }
+        }
+    }
+
+    // MARK: Geometrie
+
+    private func x(for i: Int, width: CGFloat) -> CGFloat {
+        let plotW = max(1, width - padLeft - padRight)
+        return padLeft + plotW * CGFloat(i) / CGFloat(max(slots.count - 1, 1))
+    }
+
+    private func hoverIndex(width: CGFloat) -> Int? {
+        guard let hx = hoverX, slots.count > 1 else { return nil }
+        let plotW = width - padLeft - padRight
+        guard plotW > 0 else { return nil }
+        let f = (hx - padLeft) / plotW
+        guard f >= -0.02, f <= 1.02 else { return nil }
+        return min(max(Int((f * CGFloat(slots.count - 1)).rounded()), 0), slots.count - 1)
+    }
+
+    private func dayName(_ d: Date) -> String {
+        if Calendar.current.isDateInToday(d) { return "Heute" }
+        if Calendar.current.isDateInTomorrow(d) { return "Morgen" }
+        return d.formatted(.dateTime.weekday(.abbreviated))
+    }
+
+    private func timeRange(_ d: Date) -> String {
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return "\(f.string(from: d)) – \(f.string(from: d.addingTimeInterval(slotSeconds)))"
+    }
+
+    private func tooltip(_ s: Slot) -> some View {
+        VStack(spacing: 1) {
+            Text(priceString(s.total, currency))
+                .font(.system(size: 11, weight: .semibold))
+                .foregroundStyle(Palette.text)
+                .monospacedDigit()
+            Text("\(dayName(s.id)), \(timeRange(s.id))")
+                .font(.system(size: 9))
+                .foregroundStyle(Palette.dim)
+                .monospacedDigit()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color(white: 0.17), in: RoundedRectangle(cornerRadius: 8))
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.10)))
+        .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
+        .allowsHitTesting(false)
+    }
+
+    // MARK: Zeichnen
+
+    private func draw(_ ctx: inout GraphicsContext, size: CGSize, hover: Int?) {
+        guard slots.count > 1 else { return }
+        let plotW = max(1, size.width - padLeft - padRight)
+        let plotH = max(1, size.height - padTop - padBottom)
+
+        let vals = slots.map(\.total)
+        let lo = vals.min() ?? 0
+        let hi = vals.max() ?? 1
+        let pad = max((hi - lo) * 0.18, 0.005)
+        let minV = max(0, lo - pad)
+        let maxV = hi + pad
+
+        func px(_ i: Int) -> CGFloat {
+            padLeft + plotW * CGFloat(i) / CGFloat(slots.count - 1)
+        }
+        func py(_ v: Double) -> CGFloat {
+            padTop + plotH * (1 - CGFloat((v - minV) / (maxV - minV)))
+        }
+
+        // Gitter + y-Beschriftung
+        for tick in ticks(minV, maxV) {
+            let ty = py(tick)
+            var p = Path()
+            p.move(to: CGPoint(x: padLeft, y: ty))
+            p.addLine(to: CGPoint(x: padLeft + plotW, y: ty))
+            ctx.stroke(p, with: .color(.white.opacity(0.07)), lineWidth: 1)
+            let label = currency == "EUR"
+                ? String(format: "%.0f", tick * 100)
+                : String(format: "%.2f", tick)
+            ctx.draw(ctx.resolve(Text(label).font(.system(size: 9)).foregroundColor(Palette.faint)),
+                     at: CGPoint(x: padLeft - 5, y: ty), anchor: .trailing)
+        }
+
+        let base = padTop + plotH
+        let span = max(hi - lo, 0.0001)
+        func tint(_ v: Double) -> Color { priceColor((v - lo) / span) }
+
+        // Fläche pro Segment, Farbe nach relativer Lage
+        for i in 1..<slots.count {
+            let fill = tint(vals[i])
+            var area = Path()
+            area.move(to: CGPoint(x: px(i - 1), y: base))
+            area.addLine(to: CGPoint(x: px(i - 1), y: py(vals[i - 1])))
+            area.addLine(to: CGPoint(x: px(i), y: py(vals[i])))
+            area.addLine(to: CGPoint(x: px(i), y: base))
+            area.closeSubpath()
+            ctx.fill(area, with: .color(fill.opacity(0.20)))
+        }
+        // Linie pro Segment
+        for i in 1..<slots.count {
+            var line = Path()
+            line.move(to: CGPoint(x: px(i - 1), y: py(vals[i - 1])))
+            line.addLine(to: CGPoint(x: px(i), y: py(vals[i])))
+            ctx.stroke(line, with: .color(tint(vals[i])),
+                       style: StrokeStyle(lineWidth: 1.8, lineCap: .round))
+        }
+
+        // Jetzt-Markierung (gestrichelt)
+        if now >= slots[0].id, let idx = slots.lastIndex(where: { $0.id <= now }) {
+            let elapsed = now.timeIntervalSince(slots[idx].id) / slotSeconds
+            let nx: CGFloat
+            if idx < slots.count - 1 {
+                nx = px(idx) + (px(idx + 1) - px(idx)) * CGFloat(min(max(elapsed, 0), 1))
+            } else {
+                nx = px(idx)
+            }
+            var vline = Path()
+            vline.move(to: CGPoint(x: nx, y: padTop))
+            vline.addLine(to: CGPoint(x: nx, y: base))
+            ctx.stroke(vline, with: .color(.white.opacity(0.35)),
+                       style: StrokeStyle(lineWidth: 1, dash: [2, 3]))
+            let cy = py(slots[idx].total)
+            let dot = CGRect(x: nx - 5, y: cy - 5, width: 10, height: 10)
+            ctx.fill(Path(ellipseIn: dot), with: .color(Palette.bg))
+            ctx.stroke(Path(ellipseIn: dot), with: .color(Palette.cheap), lineWidth: 2.5)
+        }
+
+        // Hover-Markierung
+        if let i = hover {
+            let hx = px(i)
+            var vline = Path()
+            vline.move(to: CGPoint(x: hx, y: padTop))
+            vline.addLine(to: CGPoint(x: hx, y: base))
+            ctx.stroke(vline, with: .color(.white.opacity(0.55)), lineWidth: 1)
+            let cy = py(vals[i])
+            let dot = CGRect(x: hx - 4.5, y: cy - 4.5, width: 9, height: 9)
+            ctx.fill(Path(ellipseIn: dot), with: .color(Palette.bg))
+            ctx.stroke(Path(ellipseIn: dot), with: .color(tint(vals[i])), lineWidth: 2.5)
+        }
+
+        // x-Beschriftung alle 4 Stunden
+        var lastLabelX: CGFloat = -100
+        for (i, s) in slots.enumerated() {
+            let comps = Calendar.current.dateComponents([.hour, .minute], from: s.id)
+            guard let h = comps.hour, h % 4 == 0, comps.minute == 0 else { continue }
+            let lx = px(i)
+            guard lx - lastLabelX > 30 else { continue }
+            lastLabelX = lx
+            ctx.draw(ctx.resolve(Text(String(format: "%02d", h)).font(.system(size: 9)).foregroundColor(Palette.faint)),
+                     at: CGPoint(x: lx, y: base + 4), anchor: .top)
+        }
+    }
+
+    private func ticks(_ lo: Double, _ hi: Double) -> [Double] {
+        let raw = (hi - lo) / 4
+        guard raw > 0 else { return [lo] }
+        let mag = pow(10, floor(log10(raw)))
+        let norm = raw / mag
+        let step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10) * mag
+        var out: [Double] = []
+        var v = (lo / step).rounded(.up) * step
+        while v < hi {
+            out.append(v)
+            v += step
+        }
+        return out
+    }
+}
+
+// MARK: - Views
+
+struct RingView: View {
+    let slot: Slot?
+    let now: Date
+    let currency: String
+    let position: Double
+
+    var body: some View {
+        let color = priceColor(position)
+        let elapsed = slot.map { min(max(now.timeIntervalSince($0.id) / 900, 0), 1) } ?? 0
+        ZStack {
+            Circle().stroke(Color.white.opacity(0.10), lineWidth: 10)
+            Circle()
+                .trim(from: 0, to: max(elapsed, 0.02))
+                .stroke(color, style: StrokeStyle(lineWidth: 10, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+                .shadow(color: color.opacity(0.45), radius: 5)
+            VStack(spacing: 1) {
+                HStack(alignment: .firstTextBaseline, spacing: 3) {
+                    Text(slot.map { amountString($0.total, currency) } ?? "–")
+                        .font(.system(size: 34, weight: .semibold, design: .rounded))
+                        .foregroundStyle(Palette.text)
+                        .monospacedDigit()
+                    Text(unitString(currency))
+                        .font(.system(size: 15, weight: .medium, design: .rounded))
+                        .foregroundStyle(Palette.text)
+                }
+                Text(rangeText)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Palette.dim)
+                    .monospacedDigit()
+            }
+        }
+        .frame(width: 132, height: 132)
+        .padding(.vertical, 2)
+    }
+
+    private var rangeText: String {
+        guard let s = slot else { return "keine Daten" }
+        let end = s.id.addingTimeInterval(900)
+        let f = DateFormatter()
+        f.dateFormat = "HH:mm"
+        return "\(f.string(from: s.id)) – \(f.string(from: end))"
+    }
+}
+
+struct Segmented: View {
+    let options: [String]
+    let selection: Int
+    let action: (Int) -> Void
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(Array(options.enumerated()), id: \.offset) { i, label in
+                Button { action(i) } label: {
+                    Text(label)
+                        .font(.system(size: 11, weight: selection == i ? .semibold : .regular))
+                        .foregroundStyle(selection == i ? Palette.text : Palette.dim)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 5)
+                        .background(selection == i ? Palette.pill : .clear, in: Capsule())
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(2)
+        .background(Color.white.opacity(0.06), in: Capsule())
+    }
+}
+
+struct TokenForm: View {
+    @ObservedObject var store: Store
+    @State private var input = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Tibber API-Token").font(.headline).foregroundStyle(Palette.text)
+            Text("developer.tibber.com → Token. Wird nur in der Keychain gespeichert.")
+                .font(.caption).foregroundStyle(Palette.dim).fixedSize(horizontal: false, vertical: true)
+            SecureField("Token einfügen", text: $input)
+                .textFieldStyle(.roundedBorder)
+                .onSubmit { store.saveToken(input) }
+            HStack {
+                Spacer()
+                Button("Speichern") { store.saveToken(input) }
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(input.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+    }
+}
+
+struct ContentView: View {
+    @ObservedObject var store: Store
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if store.locked {
+                VStack(spacing: 10) {
+                    Image(systemName: "touchid").font(.system(size: 30)).foregroundStyle(Palette.cheap)
+                    Text("Tibber-Preise gesperrt").font(.system(size: 13, weight: .medium)).foregroundStyle(Palette.text)
+                    Button("Mit Touch ID entsperren") { Task { await store.unlock() } }
+                }
+                .frame(maxWidth: .infinity, minHeight: 220)
+            } else if store.needsToken {
+                TokenForm(store: store)
+            } else {
+                topBar
+                RingView(slot: store.currentSlot, now: store.now, currency: store.currency,
+                         position: store.currentSlot.map { store.position($0.total) } ?? 0.5)
+                    .frame(maxWidth: .infinity)
+                averageLine
+                rangePicker
+                chart
+                if let err = store.status {
+                    HStack(spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(Palette.expensive)
+                        Text(err).font(.caption).foregroundStyle(Palette.dim)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+            Divider().overlay(Color.white.opacity(0.08))
+            footer
+        }
+        .padding(14)
+        .frame(width: 380)
+        .background(Palette.bg)
+        .environment(\.colorScheme, .dark)
+    }
+
+    private var topBar: some View {
+        HStack(spacing: 8) {
+            Text("Strompreis")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(Palette.text)
+            Spacer()
+            if store.loading { ProgressView().controlSize(.mini).tint(Palette.cheap) }
+            Segmented(options: ["15 Min", "60 Min"], selection: store.hourly ? 1 : 0) { i in
+                store.hourly = i == 1
+            }
+            .frame(width: 118)
+        }
+    }
+
+    private var averageLine: some View {
+        VStack(spacing: 1) {
+            Text("Durchschnittspreis: \(priceString(store.visibleAverage, store.currency))")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(Palette.text)
+            Text("Inkl. Steuern & Abgaben")
+                .font(.system(size: 10))
+                .foregroundStyle(Palette.dim)
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var rangePicker: some View {
+        Segmented(
+            options: ["Heute", "Morgen", "2 Tage"],
+            selection: store.span2 ? 2 : (store.activeDay == Calendar.current.startOfDay(for: store.now) ? 0 : 1)
+        ) { i in
+            switch i {
+            case 0:
+                store.span2 = false
+                store.selectedDay = Calendar.current.startOfDay(for: store.now)
+            case 1:
+                store.span2 = false
+                store.selectedDay = Calendar.current.date(byAdding: .day, value: 1,
+                                                         to: Calendar.current.startOfDay(for: store.now))
+            default:
+                store.span2 = true
+                store.selectedDay = Calendar.current.startOfDay(for: store.now)
+            }
+        }
+    }
+
+    private var chart: some View {
+        Group {
+            if store.chartSlots.count < 2 {
+                Text("Für diesen Tag liegen noch keine Preise vor.")
+                    .font(.caption).foregroundStyle(Palette.dim)
+                    .frame(maxWidth: .infinity, minHeight: 150)
+            } else {
+                PriceChart(slots: store.chartSlots, currency: store.currency,
+                           now: store.now, slotSeconds: store.hourly ? 3600 : store.slotSeconds)
+                    .frame(height: 150)
+                HStack(spacing: 4) {
+                    Text("cent").font(.system(size: 9)).foregroundColor(Palette.faint)
+                    Spacer()
+                    if let c = store.currentSlot {
+                        Text("\(levelLabel(store.position(c.total))) · \(priceString(c.total, store.currency))")
+                            .font(.system(size: 9))
+                            .foregroundStyle(priceColor(store.position(c.total)))
+                    }
+                }
+            }
+        }
+    }
+
+    private var footer: some View {
+        HStack(spacing: 8) {
+            Text(store.updated.map { "Stand \($0.formatted(date: .omitted, time: .shortened))" } ?? "keine Daten")
+                .font(.system(size: 10)).foregroundStyle(Palette.faint)
+            Spacer()
+            if store.loading {
+                ProgressView().controlSize(.mini)
+            } else {
+                Button("Aktualisieren") { Task { await store.refresh() } }
+                    .buttonStyle(.plain)
+            }
+            Button("Token") { store.needsToken = true }
+                .buttonStyle(.plain)
+            Button("Beenden") { NSApp.terminate(nil) }
+                .buttonStyle(.plain)
+        }
+        .font(.system(size: 10))
+        .foregroundStyle(Palette.dim)
+    }
+}
+
+// MARK: - App
+
+struct TibberApp: App {
+    @StateObject private var store = Store()
+
+    var body: some Scene {
+        MenuBarExtra {
+            ContentView(store: store)
+        } label: {
+            Text(store.currentSlot.map { priceString($0.total, store.currency) } ?? "– ct")
+                .monospacedDigit()
+        }
+        .menuBarExtraStyle(.window)
+    }
+}
+
+// MARK: - Preview (Layout ohne Screen-Recording prüfen)
+
+enum Preview {
+    @MainActor static func run() {
+        let store = Store(authenticate: false)
+        let renderer = ImageRenderer(
+            content: ContentView(store: store)
+                .environment(\.colorScheme, .dark)
+                .background(Palette.bg)
+        )
+        renderer.scale = 2
+        guard let img = renderer.nsImage,
+              let tiff = img.tiffRepresentation,
+              let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else {
+            print("render fehlgeschlagen")
+            exit(1)
+        }
+        let url = URL(fileURLWithPath: "/tmp/tibber-preview.png")
+        try? png.write(to: url)
+        print("ok \(url.path)")
+        exit(0)
+    }
+}
+
+// MARK: - Self-Check
+
+enum SelfCheck {
+    static let sample = """
+    {"data":{"viewer":{"homes":[{"currentSubscription":{"priceInfo":{
+      "current":{"total":0.2951,"startsAt":"2026-10-23T16:00:00.000+02:00","level":"CHEAP","currency":"EUR"},
+      "today":[
+        {"total":0.30,"startsAt":"2026-10-22T00:00:00.000+02:00","level":"NORMAL","currency":"EUR"},
+        {"total":0.20,"startsAt":"2026-10-23T00:00:00.000+02:00","level":"CHEAP","currency":"EUR"},
+        {"total":0.40,"startsAt":"2026-10-23T00:15:00.000+02:00","level":"EXPENSIVE","currency":"EUR"}
+      ],
+      "tomorrow":[
+        {"total":0.10,"startsAt":"2026-10-24T00:00:00.000+02:00","level":"VERY_CHEAP","currency":"EUR"}
+      ]}}}]}}}
+    """
+
+    @MainActor static func run() {
+        var fails = 0
+        func check(_ cond: Bool, _ what: String) {
+            if cond { print("ok   \(what)") } else { print("FAIL \(what)"); fails += 1 }
+        }
+
+        let parsed = try? GraphQL.parse(Data(sample.utf8))
+        let slots = parsed?.slots ?? []
+        check(slots.count == 4, "4 Slots geparst (bekam \(slots.count))")
+        check(slots.map(\.id) == slots.map(\.id).sorted(), "Slots chronologisch")
+        check(parsed?.currency == "EUR", "Währung EUR")
+        check(slots.last?.total == 0.10, "Betrag korrekt")
+
+        let now = ISO.frac.date(from: "2026-10-23T00:20:00.000+02:00")!
+        check(pickCurrent(in: slots, at: now)?.id == ISO.frac.date(from: "2026-10-23T00:15:00.000+02:00"),
+              "aktuelle Viertelstunde = 00:15")
+        check(pickCurrent(in: slots, at: slots[0].id.addingTimeInterval(-60))?.id == slots[0].id,
+              "vor dem ersten Slot -> erster Slot")
+
+        check(priceString(0.2951, "EUR") == "29,5 ct", "Format EUR -> ct mit Komma")
+        check(priceString(1.25, "NOK") == "1,250 NOK", "Format Fremdwährung")
+        check(amountString(0.2951, "EUR") == "29,5", "Ringzahl ohne Einheit")
+
+        let day = Calendar.current.startOfDay(for: ISO.frac.date(from: "2026-10-23T00:00:00.000+02:00")!)
+        let daySlots = slots.filter { Calendar.current.isDate($0.id, inSameDayAs: day) }
+        check(daySlots.count == 2, "Tagestrennung (bekam \(daySlots.count))")
+
+        // Stunden-Aggregation: 8 Viertelstunden ab voller Stunde -> 2 Stunden
+        let base = Calendar.current.dateInterval(of: .hour, for: Date(timeIntervalSince1970: 1_700_000_000))!.start
+        let quarter = (0..<8).map { i in
+            Slot(id: base.addingTimeInterval(Double(i) * 900), total: Double(i), level: "NORMAL")
+        }
+        let hours = Store.hourly(quarter)
+        check(hours.count == 2, "Stunden-Aggregation (\(hours.count) Stunden)")
+        check(hours.first.map { abs($0.total - 1.5) < 0.001 } ?? false, "Stundenmittel 1. Hälfte")
+        check(hours.last.map { abs($0.total - 5.5) < 0.001 } ?? false, "Stundenmittel 2. Hälfte")
+
+        func close(_ a: Color, _ b: Color) -> Bool {
+            guard let ca = NSColor(a).usingColorSpace(.sRGB),
+                  let cb = NSColor(b).usingColorSpace(.sRGB) else { return false }
+            return abs(ca.redComponent - cb.redComponent) < 0.01
+                && abs(ca.greenComponent - cb.greenComponent) < 0.01
+                && abs(ca.blueComponent - cb.blueComponent) < 0.01
+        }
+        check(priceColor(0) == Palette.cheap, "Farbe günstig = Türkis")
+        check(close(priceColor(1), Palette.veryExpensive), "Farbe teuer = Rot")
+        check(!close(priceColor(0.2), priceColor(0.9)), "günstig und teuer unterscheidbar")
+        check(levelLabel(0.1) == "günstig" && levelLabel(0.5) == "normal" && levelLabel(0.9) == "teuer",
+              "Level-Text passt zur Farbe")
+
+        print(fails == 0 ? "\nselfcheck: ok" : "\nselfcheck: \(fails) Fehler")
+        exit(fails == 0 ? 0 : 1)
+    }
+}
+
+@main
+enum Main {
+    static func main() {
+        let args = CommandLine.arguments
+        if args.contains("--selfcheck") { MainActor.assumeIsolated { SelfCheck.run() } }
+        if args.contains("--preview") { MainActor.assumeIsolated { Preview.run() } }
+        if let i = args.firstIndex(of: "--set-token"), i + 1 < args.count {
+            Keychain.save(args[i + 1])
+            print("Token in Keychain gespeichert.")
+            exit(0)
+        }
+        TibberApp.main()
+    }
+}
