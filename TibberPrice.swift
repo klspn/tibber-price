@@ -256,10 +256,9 @@ final class Store: ObservableObject {
     }
 
     var activeDay: Date {
-        let ds = days
         let today = Calendar.current.startOfDay(for: now)
-        if let s = selectedDay, ds.contains(s) { return s }
-        return ds.contains(today) ? today : (ds.first ?? today)
+        if let s = selectedDay { return s }
+        return days.contains(today) ? today : (days.first ?? today)
     }
 
     func slots(on day: Date) -> [Slot] {
@@ -293,6 +292,10 @@ final class Store: ObservableObject {
         let v = visibleSlots
         guard !v.isEmpty else { return 0 }
         return v.map(\.total).reduce(0, +) / Double(v.count)
+    }
+
+    func isTomorrow(_ d: Date) -> Bool {
+        Calendar.current.isDateInTomorrow(d)
     }
 
     var slotSeconds: TimeInterval {
@@ -345,7 +348,16 @@ final class Store: ObservableObject {
             return false
         }
         // Preise ändern sich 1x/Tag; 6 h Cache reicht und schont das Rate-Limit.
-        return now.timeIntervalSince(m) < 6 * 3600 && slots.contains { $0.id > now.addingTimeInterval(3600) }
+        let fresh = now.timeIntervalSince(m) < 6 * 3600
+            && slots.contains { $0.id > now.addingTimeInterval(3600) }
+        guard fresh else { return false }
+        // Preise für morgen kommen meist ab 13 Uhr: bis sie da sind, viertelstündlich nachfragen.
+        if Calendar.current.component(.hour, from: now) >= 13 {
+            let tomorrow = Calendar.current.date(byAdding: .day, value: 1,
+                                                 to: Calendar.current.startOfDay(for: now))!
+            return slots.contains { $0.id >= tomorrow }
+        }
+        return true
     }
 
     private func loadCache() {
@@ -776,7 +788,9 @@ struct ContentView: View {
 
     private var averageLine: some View {
         VStack(spacing: 1) {
-            Text("Durchschnittspreis: \(priceString(store.visibleAverage, store.currency))")
+            Text(store.visibleSlots.isEmpty
+                 ? "Durchschnittspreis: –"
+                 : "Durchschnittspreis: \(priceString(store.visibleAverage, store.currency))")
                 .font(.system(size: 13, weight: .medium))
                 .foregroundStyle(Palette.text)
             Text("Inkl. Steuern & Abgaben")
@@ -809,9 +823,15 @@ struct ContentView: View {
     private var chart: some View {
         Group {
             if store.chartSlots.count < 2 {
-                Text("Für diesen Tag liegen noch keine Preise vor.")
-                    .font(.caption).foregroundStyle(Palette.dim)
-                    .frame(maxWidth: .infinity, minHeight: 150)
+                VStack(spacing: 4) {
+                    Text(emptyMessage)
+                        .font(.caption).foregroundStyle(Palette.dim)
+                    if store.isTomorrow(store.activeDay) {
+                        Text("Meist ab 13 Uhr verfügbar.")
+                            .font(.system(size: 10)).foregroundStyle(Palette.faint)
+                    }
+                }
+                .frame(maxWidth: .infinity, minHeight: 150)
             } else {
                 PriceChart(slots: store.chartSlots, currency: store.currency,
                            now: store.now, slotSeconds: store.hourly ? 3600 : store.slotSeconds)
@@ -829,6 +849,10 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private var emptyMessage: String {
+        store.isTomorrow(store.activeDay) ? "Preise für morgen noch nicht veröffentlicht." : "Für diesen Tag liegen keine Preise vor."
     }
 
     private var footer: some View {
@@ -953,6 +977,17 @@ enum SelfCheck {
                 && abs(ca.greenComponent - cb.greenComponent) < 0.01
                 && abs(ca.blueComponent - cb.blueComponent) < 0.01
         }
+        let emptyTomorrow = sample.replacingOccurrences(
+            of: """
+            "tomorrow":[
+                {"total":0.10,"startsAt":"2026-10-24T00:00:00.000+02:00","level":"VERY_CHEAP","currency":"EUR"}
+              ]
+            """,
+            with: "\"tomorrow\":[]")
+        let withoutTomorrow = try? GraphQL.parse(Data(emptyTomorrow.utf8))
+        check(withoutTomorrow?.slots.count == 3, "leeres tomorrow wird akzeptiert")
+        check(withoutTomorrow?.currency == "EUR", "Währung auch ohne morgige Preise")
+
         check(priceColor(0) == Palette.cheap, "Farbe günstig = Türkis")
         check(close(priceColor(1), Palette.veryExpensive), "Farbe teuer = Rot")
         check(!close(priceColor(0.2), priceColor(0.9)), "günstig und teuer unterscheidbar")
