@@ -672,13 +672,14 @@ struct PriceChart: View {
 
 struct RingView: View {
     let slot: Slot?
-    let now: Date
     let currency: String
     let position: Double
     let slotSeconds: TimeInterval
 
     var body: some View {
         let color = priceColor(position)
+        // Füllstand = Preis-Lage: leer = günstigster, voll = teuerster Slot des Zeitraums.
+        let fraction = min(max(position, 0), 1)
         ZStack {
             Circle().stroke(Color.white.opacity(0.10), lineWidth: 10)
             Circle()
@@ -707,15 +708,6 @@ struct RingView: View {
         }
         .frame(width: 132, height: 132)
         .padding(.vertical, 2)
-    }
-
-    /// Anteil des Slots, der schon vorbei ist (0…1).
-    private var fraction: Double {
-        guard let s = slot else { return 0 }
-        let end = s.id.addingTimeInterval(slotSeconds)
-        if now >= end { return 1 }
-        if now <= s.id { return 0 }
-        return now.timeIntervalSince(s.id) / slotSeconds
     }
 
     private var rangeText: String {
@@ -845,7 +837,7 @@ struct ContentView: View {
             } else {
                 topBar
                 let shown = hovered ?? store.currentSlot
-                RingView(slot: shown, now: store.now, currency: store.currency,
+                RingView(slot: shown, currency: store.currency,
                          position: shown.map { store.position($0.total) } ?? 0.5,
                          slotSeconds: hovered != nil && store.hourly ? 3600 : store.slotSeconds)
                     .animation(.easeInOut(duration: 0.3), value: hovered?.id)
