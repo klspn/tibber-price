@@ -3,6 +3,8 @@
 import SwiftUI
 import Security
 import LocalAuthentication
+import ServiceManagement
+import Combine
 
 // MARK: - Modell
 
@@ -186,6 +188,22 @@ enum Keychain {
     }
 }
 
+// MARK: - Autostart
+
+enum LoginItem {
+    static var enabled: Bool { SMAppService.mainApp.status == .enabled }
+
+    /// nil = ok, sonst Fehlertext
+    static func set(_ on: Bool) -> String? {
+        do {
+            if on { try SMAppService.mainApp.register() } else { try SMAppService.mainApp.unregister() }
+            return nil
+        } catch {
+            return error.localizedDescription
+        }
+    }
+}
+
 // MARK: - Touch ID
 
 enum Auth {
@@ -242,6 +260,8 @@ final class Store: ObservableObject {
         startLoop()
         if !cacheUsable { await refresh() }
     }
+
+    var hasToken: Bool { token != nil }
 
     func unlock() async {
         await bootstrap()
@@ -713,11 +733,21 @@ struct Segmented: View {
 
 struct TokenForm: View {
     @ObservedObject var store: Store
+    var onClose: (() -> Void)? = nil
     @State private var input = ""
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Tibber API-Token").font(.headline).foregroundStyle(Palette.text)
+            HStack {
+                Text("Tibber API-Token").font(.headline).foregroundStyle(Palette.text)
+                Spacer()
+                if store.hasToken, let onClose {
+                    Button("Zurück") { onClose() }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 11))
+                        .foregroundStyle(Palette.dim)
+                }
+            }
             Text("developer.tibber.com → Token. Wird nur in der Keychain gespeichert.")
                 .font(.caption).foregroundStyle(Palette.dim).fixedSize(horizontal: false, vertical: true)
             SecureField("Token einfügen", text: $input)
@@ -733,8 +763,57 @@ struct TokenForm: View {
     }
 }
 
+struct SettingsScreen: View {
+    @ObservedObject var store: Store
+    var onClose: () -> Void
+
+    @State private var launchAtLogin = LoginItem.enabled
+    @State private var error: String?
+    @AppStorage("hoverOpen") private var hoverOpen = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack {
+                Text("Einstellungen").font(.headline).foregroundStyle(Palette.text)
+                Spacer()
+                Button("Zurück") { onClose() }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 11))
+                    .foregroundStyle(Palette.dim)
+            }
+            Toggle("Beim Anmelden starten", isOn: Binding(
+                get: { launchAtLogin },
+                set: { v in
+                    launchAtLogin = v
+                    error = LoginItem.set(v)
+                    launchAtLogin = LoginItem.enabled
+                }
+            ))
+            Toggle("Beim Drüberfahren öffnen", isOn: $hoverOpen)
+            if let error {
+                Text(error).font(.system(size: 10)).foregroundStyle(Palette.expensive)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Text("Start braucht Touch ID. Preise werden 1× pro Tag geladen.")
+                .font(.system(size: 10)).foregroundStyle(Palette.faint)
+                .fixedSize(horizontal: false, vertical: true)
+            Spacer(minLength: 0)
+        }
+        .toggleStyle(.switch)
+        .frame(maxWidth: .infinity, minHeight: 200, alignment: .topLeading)
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var store: Store
+    @State private var screen: Screen
+
+    enum Screen { case prices, token, settings }
+
+    init(store: Store, initialScreen: Screen = .prices) {
+        self.store = store
+        _screen = State(initialValue: initialScreen)
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -745,8 +824,10 @@ struct ContentView: View {
                     Button("Mit Touch ID entsperren") { Task { await store.unlock() } }
                 }
                 .frame(maxWidth: .infinity, minHeight: 220)
-            } else if store.needsToken {
-                TokenForm(store: store)
+            } else if store.needsToken || screen == .token {
+                TokenForm(store: store, onClose: { screen = .prices })
+            } else if screen == .settings {
+                SettingsScreen(store: store, onClose: { screen = .prices })
             } else {
                 topBar
                 RingView(slot: store.currentSlot, now: store.now, currency: store.currency,
@@ -866,7 +947,9 @@ struct ContentView: View {
                 Button("Aktualisieren") { Task { await store.refresh() } }
                     .buttonStyle(.plain)
             }
-            Button("Token") { store.needsToken = true }
+            Button("Token") { screen = .token }
+                .buttonStyle(.plain)
+            Button("Einstellungen") { screen = .settings }
                 .buttonStyle(.plain)
             Button("Beenden") { NSApp.terminate(nil) }
                 .buttonStyle(.plain)
@@ -876,19 +959,129 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Statusleiste
+
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private var statusItem: NSStatusItem?
+    private let popover = NSPopover()
+    private var store: Store?
+    private var bag = Set<AnyCancellable>()
+    private var hoverWork: DispatchWorkItem?
+    private var watch: Task<Void, Never>?
+    private var openedByHover = false
+    private var lastCloseAt = Date.distantPast
+
+    private var hoverOpen: Bool { UserDefaults.standard.bool(forKey: "hoverOpen") }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSApp.setActivationPolicy(.accessory)
+
+        let store = Store()
+        self.store = store
+        let hosting = NSHostingController(rootView: ContentView(store: store))
+        hosting.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = hosting
+        popover.delegate = self
+        popover.behavior = .transient
+        popover.animates = false
+
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem = item
+        if let button = item.button {
+            button.target = self
+            button.action = #selector(buttonClicked)
+            button.sendAction(on: [.leftMouseUp])
+            button.addTrackingArea(NSTrackingArea(
+                rect: button.bounds,
+                options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                owner: self, userInfo: nil))
+            updateTitle()
+        }
+
+        // Menüleisten-Text mit dem Store mitziehen
+        store.objectWillChange
+            .sink { [weak self] _ in
+                DispatchQueue.main.async { self?.updateTitle() }
+            }
+            .store(in: &bag)
+    }
+
+    private func updateTitle() {
+        guard let store, let button = statusItem?.button else { return }
+        button.title = store.currentSlot.map { priceString($0.total, store.currency) } ?? "– ct"
+        button.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+    }
+
+    @objc private func buttonClicked() {
+        // transient schließt beim Klick schon selbst – dann nicht sofort wieder öffnen
+        guard Date().timeIntervalSince(lastCloseAt) > 0.25 else { return }
+        if popover.isShown { closePopover() } else { showPopover(hover: false) }
+    }
+
+    private func showPopover(hover: Bool) {
+        guard let button = statusItem?.button, !popover.isShown else { return }
+        openedByHover = hover
+        NSApp.activate(ignoringOtherApps: true)
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        if hover { startLeaveWatch() }
+    }
+
+    private func closePopover() {
+        watch?.cancel()
+        hoverWork?.cancel()
+        popover.performClose(nil)
+        openedByHover = false
+    }
+
+    /// Schließt nur, wenn per Hover geöffnet und die Maus weder über Popover noch Icon steht.
+    private func startLeaveWatch() {
+        watch?.cancel()
+        watch = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(150))
+                guard let self else { return }
+                let p = NSEvent.mouseLocation
+                let inPopover = self.popover.contentViewController?.view.window?.frame.contains(p) ?? false
+                let inButton = self.statusItem?.button?.window?.frame.contains(p) ?? false
+                if !inPopover && !inButton {
+                    self.closePopover()
+                    return
+                }
+            }
+        }
+    }
+
+    func mouseEntered(with event: NSEvent) {
+        guard hoverOpen, !popover.isShown else { return }
+        hoverWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in self?.showPopover(hover: true) }
+        hoverWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+    }
+
+    func mouseExited(with event: NSEvent) {
+        hoverWork?.cancel()
+        guard openedByHover, popover.isShown else { return }
+        startLeaveWatch()
+    }
+}
+
+extension AppDelegate: NSPopoverDelegate {
+    func popoverDidClose(_ notification: Notification) {
+        lastCloseAt = Date()
+        openedByHover = false
+        watch?.cancel()
+    }
+}
+
 // MARK: - App
 
 struct TibberApp: App {
-    @StateObject private var store = Store()
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
 
     var body: some Scene {
-        MenuBarExtra {
-            ContentView(store: store)
-        } label: {
-            Text(store.currentSlot.map { priceString($0.total, store.currency) } ?? "– ct")
-                .monospacedDigit()
-        }
-        .menuBarExtraStyle(.window)
+        Settings { EmptyView() }
     }
 }
 
@@ -897,8 +1090,11 @@ struct TibberApp: App {
 enum Preview {
     @MainActor static func run() {
         let store = Store(authenticate: false)
+        let args = CommandLine.arguments
+        let screen: ContentView.Screen = args.contains("--preview-settings") ? .settings
+            : args.contains("--preview-token") ? .token : .prices
         let renderer = ImageRenderer(
-            content: ContentView(store: store)
+            content: ContentView(store: store, initialScreen: screen)
                 .environment(\.colorScheme, .dark)
                 .background(Palette.bg)
         )
@@ -1004,7 +1200,18 @@ enum Main {
     static func main() {
         let args = CommandLine.arguments
         if args.contains("--selfcheck") { MainActor.assumeIsolated { SelfCheck.run() } }
-        if args.contains("--preview") { MainActor.assumeIsolated { Preview.run() } }
+        if args.contains(where: { $0.hasPrefix("--preview") }) { MainActor.assumeIsolated { Preview.run() } }
+        if let i = args.firstIndex(of: "--login"), i + 1 < args.count {
+            let what = args[i + 1]
+            switch what {
+            case "on", "off":
+                let err = LoginItem.set(what == "on")
+                print(err.map { "Fehler: \($0)" } ?? "ok, enabled=\(LoginItem.enabled)")
+            default:
+                print("enabled=\(LoginItem.enabled) status=\(SMAppService.mainApp.status.rawValue)")
+            }
+            exit(0)
+        }
         if let i = args.firstIndex(of: "--set-token"), i + 1 < args.count {
             Keychain.save(args[i + 1])
             print("Token in Keychain gespeichert.")
