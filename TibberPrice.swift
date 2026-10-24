@@ -452,6 +452,8 @@ struct PriceChart: View {
     let now: Date
     let slotSeconds: TimeInterval
 
+    var onHover: (Slot?) -> Void = { _ in }
+
     @State private var hoverX: CGFloat?
 
     private let padLeft: CGFloat = 22
@@ -476,8 +478,12 @@ struct PriceChart: View {
             .contentShape(Rectangle())
             .onContinuousHover { phase in
                 switch phase {
-                case .active(let p): hoverX = p.x
-                case .ended: hoverX = nil
+                case .active(let p):
+                    hoverX = p.x
+                    onHover(index(atX: p.x, width: w).map { slots[$0] })
+                case .ended:
+                    hoverX = nil
+                    onHover(nil)
                 }
             }
         }
@@ -498,7 +504,12 @@ struct PriceChart: View {
     }
 
     private func hoverIndex(width: CGFloat) -> Int? {
-        guard let hx = hoverX, slots.count > 1 else { return nil }
+        guard let hx = hoverX else { return nil }
+        return index(atX: hx, width: width)
+    }
+
+    private func index(atX hx: CGFloat, width: CGFloat) -> Int? {
+        guard slots.count > 1 else { return nil }
         let plotW = width - padLeft - padRight
         guard plotW > 0 else { return nil }
         let f = (hx - padLeft) / plotW
@@ -664,17 +675,19 @@ struct RingView: View {
     let now: Date
     let currency: String
     let position: Double
+    let slotSeconds: TimeInterval
 
     var body: some View {
         let color = priceColor(position)
-        let elapsed = slot.map { min(max(now.timeIntervalSince($0.id) / 900, 0), 1) } ?? 0
         ZStack {
             Circle().stroke(Color.white.opacity(0.10), lineWidth: 10)
             Circle()
-                .trim(from: 0, to: max(elapsed, 0.02))
+                .trim(from: 0, to: max(fraction, 0.02))
                 .stroke(color, style: StrokeStyle(lineWidth: 10, lineCap: .round))
                 .rotationEffect(.degrees(-90))
                 .shadow(color: color.opacity(0.45), radius: 5)
+                .animation(.easeInOut(duration: 0.3), value: fraction)
+                .animation(.easeInOut(duration: 0.3), value: position)
             VStack(spacing: 1) {
                 HStack(alignment: .firstTextBaseline, spacing: 3) {
                     Text(slot.map { amountString($0.total, currency) } ?? "–")
@@ -690,14 +703,24 @@ struct RingView: View {
                     .foregroundStyle(Palette.dim)
                     .monospacedDigit()
             }
+            .animation(.easeInOut(duration: 0.2), value: slot?.id)
         }
         .frame(width: 132, height: 132)
         .padding(.vertical, 2)
     }
 
+    /// Anteil des Slots, der schon vorbei ist (0…1).
+    private var fraction: Double {
+        guard let s = slot else { return 0 }
+        let end = s.id.addingTimeInterval(slotSeconds)
+        if now >= end { return 1 }
+        if now <= s.id { return 0 }
+        return now.timeIntervalSince(s.id) / slotSeconds
+    }
+
     private var rangeText: String {
         guard let s = slot else { return "keine Daten" }
-        let end = s.id.addingTimeInterval(900)
+        let end = s.id.addingTimeInterval(slotSeconds)
         let f = DateFormatter()
         f.dateFormat = "HH:mm"
         return "\(f.string(from: s.id)) – \(f.string(from: end))"
@@ -804,6 +827,7 @@ struct SettingsScreen: View {
 struct ContentView: View {
     @ObservedObject var store: Store
     @State private var screen: Screen
+    @State private var hovered: Slot?
 
     enum Screen { case prices, token, settings }
 
@@ -820,8 +844,11 @@ struct ContentView: View {
                 SettingsScreen(store: store, onClose: { screen = .prices })
             } else {
                 topBar
-                RingView(slot: store.currentSlot, now: store.now, currency: store.currency,
-                         position: store.currentSlot.map { store.position($0.total) } ?? 0.5)
+                let shown = hovered ?? store.currentSlot
+                RingView(slot: shown, now: store.now, currency: store.currency,
+                         position: shown.map { store.position($0.total) } ?? 0.5,
+                         slotSeconds: hovered != nil && store.hourly ? 3600 : store.slotSeconds)
+                    .animation(.easeInOut(duration: 0.3), value: hovered?.id)
                     .frame(maxWidth: .infinity)
                 averageLine
                 rangePicker
@@ -888,6 +915,7 @@ struct ContentView: View {
                 store.span2 = true
                 store.selectedDay = Calendar.current.startOfDay(for: store.now)
             }
+            hovered = nil
         }
     }
 
@@ -905,7 +933,8 @@ struct ContentView: View {
                 .frame(maxWidth: .infinity, minHeight: 150)
             } else {
                 PriceChart(slots: store.chartSlots, currency: store.currency,
-                           now: store.now, slotSeconds: store.hourly ? 3600 : store.slotSeconds)
+                           now: store.now, slotSeconds: store.hourly ? 3600 : store.slotSeconds,
+                           onHover: { hovered = $0 })
                     .frame(height: 150)
                     .overlay(alignment: .topLeading) {
                         Text("cent").font(.system(size: 9)).foregroundColor(Palette.faint)
