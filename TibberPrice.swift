@@ -961,6 +961,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var watch: Task<Void, Never>?
     private var openedByHover = false
     private var lastCloseAt = Date.distantPast
+    private var localMonitor: Any?
 
     private var hoverOpen: Bool { UserDefaults.standard.bool(forKey: "hoverOpen") }
 
@@ -1014,14 +1015,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         openedByHover = hover
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        watchClicks()
         if hover { startLeaveWatch() }
     }
 
     private func closePopover() {
         watch?.cancel()
         hoverWork?.cancel()
+        removeClickWatch()
         popover.performClose(nil)
         openedByHover = false
+    }
+
+    /// Erster Klick im Popover pinnt es: kein Auto-Schließen mehr beim Verlassen der Maus.
+    private func watchClicks() {
+        removeClickWatch()
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
+            guard let self else { return event }
+            if self.popover.isShown,
+               event.window === self.popover.contentViewController?.view.window {
+                self.openedByHover = false
+                self.watch?.cancel()
+            }
+            return event
+        }
+    }
+
+    private func removeClickWatch() {
+        if let localMonitor { NSEvent.removeMonitor(localMonitor) }
+        localMonitor = nil
     }
 
     /// Schließt nur, wenn per Hover geöffnet und die Maus weder über Popover noch Icon steht.
@@ -1062,6 +1084,7 @@ extension AppDelegate: NSPopoverDelegate {
         lastCloseAt = Date()
         openedByHover = false
         watch?.cancel()
+        removeClickWatch()
     }
 }
 
