@@ -2,7 +2,6 @@
 // Daten: Tibber GraphQL, priceInfo(resolution: QUARTER_HOURLY).
 import SwiftUI
 import Security
-import LocalAuthentication
 import ServiceManagement
 import Combine
 
@@ -152,38 +151,60 @@ enum GraphQL {
     }
 }
 
-// MARK: - Keychain
+// MARK: - Token-Ablage
 
-enum Keychain {
-    static let service = "de.klspn.TibberPrice"
-    static let account = "tibber-token"
+// Bewusst Datei statt Keychain: Keychain-Einträge einer ad-hoc signierten App lösen
+// nach jedem Build einen Passwort-Dialog aus (ACL hängt an der Signatur).
+// Schutz: nur für den eigenen Benutzer lesbar (0600).
+enum TokenStore {
+    private static var dir: URL {
+        let d = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("TibberPrice", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }
+
+    static var url: URL { dir.appendingPathComponent("token") }
+
+    static func load() -> String? {
+        if let d = try? Data(contentsOf: url),
+           let s = String(data: d, encoding: .utf8), !s.isEmpty {
+            return s
+        }
+        // Migration aus der früheren Keychain-Ablage
+        if let legacy = legacyKeychainLoad() {
+            save(legacy)
+            legacyKeychainDelete()
+            return legacy
+        }
+        return nil
+    }
+
+    static func save(_ token: String) {
+        try? FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? Data(token.utf8).write(to: url, options: .atomic)
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+    }
 
     private static var base: [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
-         kSecAttrService as String: service,
-         kSecAttrAccount as String: account]
+         kSecAttrService as String: "de.klspn.TibberPrice",
+         kSecAttrAccount as String: "tibber-token"]
     }
 
-    static func load() -> String? {
+    private static func legacyKeychainLoad() -> String? {
         var q = base
         q[kSecReturnData as String] = true
         q[kSecMatchLimit as String] = kSecMatchLimitOne
         var out: CFTypeRef?
         guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess,
               let data = out as? Data,
-              let s = String(data: data, encoding: .utf8),
-              !s.isEmpty else { return nil }
+              let s = String(data: data, encoding: .utf8), !s.isEmpty else { return nil }
         return s
     }
 
-    static func save(_ token: String) {
-        delete()
-        var q = base
-        q[kSecValueData as String] = Data(token.utf8)
-        SecItemAdd(q as CFDictionary, nil)
-    }
-
-    static func delete() {
+    private static func legacyKeychainDelete() {
         SecItemDelete(base as CFDictionary)
     }
 }
@@ -204,21 +225,6 @@ enum LoginItem {
     }
 }
 
-// MARK: - Touch ID
-
-enum Auth {
-    /// Einmal pro App-Start. Macs ohne Biometrie fallen auf das Login-Passwort zurück.
-    @MainActor static func require() async -> Bool {
-        let ctx = LAContext()
-        ctx.localizedFallbackTitle = "Passwort verwenden"
-        var err: NSError?
-        guard ctx.canEvaluatePolicy(.deviceOwnerAuthentication, error: &err) else { return true }
-        NSApp.activate(ignoringOtherApps: true)
-        return (try? await ctx.evaluatePolicy(.deviceOwnerAuthentication,
-                                             localizedReason: "Tibber-Preise freigeben")) ?? false
-    }
-}
-
 // MARK: - Store
 
 @MainActor
@@ -233,12 +239,11 @@ final class Store: ObservableObject {
     @Published var span2 = false                  // Heute/Morgen vs. 2 Tage
     @Published var hourly = false                 // 60-Minuten-Ansicht
     @Published var now = Date()
-    @Published var locked = false
 
     private var loop: Task<Void, Never>?
     private var token: String?
 
-    /// authenticate: false nur für --preview (Layout ohne Keychain/Touch ID rendern).
+    /// authenticate: false nur für --preview (rendert nur den Cache).
     init(authenticate: Bool = true) {
         if authenticate {
             Task { await bootstrap() }
@@ -248,12 +253,8 @@ final class Store: ObservableObject {
     }
 
     private func bootstrap() async {
-        // kurz warten, bis die Menüleisten-App läuft – sonst kann der Systemdialog nicht erscheinen
-        try? await Task.sleep(for: .milliseconds(400))
-        guard await Auth.require() else { locked = true; return }
-        locked = false
         // Token genau einmal pro Start lesen, danach nur noch aus dem Speicher.
-        token = Keychain.load()
+        token = TokenStore.load()
         needsToken = token == nil
         guard !needsToken else { return }
         loadCache()
@@ -262,10 +263,6 @@ final class Store: ObservableObject {
     }
 
     var hasToken: Bool { token != nil }
-
-    func unlock() async {
-        await bootstrap()
-    }
 
     // MARK: abgeleitet
 
@@ -422,7 +419,7 @@ final class Store: ObservableObject {
     func saveToken(_ raw: String) {
         let t = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !t.isEmpty else { return }
-        Keychain.save(t)
+        TokenStore.save(t)
         token = t
         needsToken = false
         startLoop()
@@ -794,7 +791,7 @@ struct SettingsScreen: View {
                 Text(error).font(.system(size: 10)).foregroundStyle(Palette.expensive)
                     .fixedSize(horizontal: false, vertical: true)
             }
-            Text("Start braucht Touch ID. Preise werden 1× pro Tag geladen.")
+            Text("Token liegt in ~/Library/Application Support/TibberPrice/token (nur für dich lesbar).")
                 .font(.system(size: 10)).foregroundStyle(Palette.faint)
                 .fixedSize(horizontal: false, vertical: true)
             Spacer(minLength: 0)
@@ -817,14 +814,7 @@ struct ContentView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if store.locked {
-                VStack(spacing: 10) {
-                    Image(systemName: "touchid").font(.system(size: 30)).foregroundStyle(Palette.cheap)
-                    Text("Tibber-Preise gesperrt").font(.system(size: 13, weight: .medium)).foregroundStyle(Palette.text)
-                    Button("Mit Touch ID entsperren") { Task { await store.unlock() } }
-                }
-                .frame(maxWidth: .infinity, minHeight: 220)
-            } else if store.needsToken || screen == .token {
+            if store.needsToken || screen == .token {
                 TokenForm(store: store, onClose: { screen = .prices })
             } else if screen == .settings {
                 SettingsScreen(store: store, onClose: { screen = .prices })
@@ -1052,15 +1042,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    func mouseEntered(with event: NSEvent) {
+    @objc(mouseEntered:) func hoverEnter(_ event: NSEvent) {
         guard hoverOpen, !popover.isShown else { return }
         hoverWork?.cancel()
         let work = DispatchWorkItem { [weak self] in self?.showPopover(hover: true) }
         hoverWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
     }
 
-    func mouseExited(with event: NSEvent) {
+    @objc(mouseExited:) func hoverExit(_ event: NSEvent) {
         hoverWork?.cancel()
         guard openedByHover, popover.isShown else { return }
         startLeaveWatch()
@@ -1184,6 +1174,9 @@ enum SelfCheck {
         check(withoutTomorrow?.slots.count == 3, "leeres tomorrow wird akzeptiert")
         check(withoutTomorrow?.currency == "EUR", "Währung auch ohne morgige Preise")
 
+        check(AppDelegate().responds(to: NSSelectorFromString("mouseEntered:")), "Hover-Selector mouseEntered:")
+        check(AppDelegate().responds(to: NSSelectorFromString("mouseExited:")), "Hover-Selector mouseExited:")
+
         check(priceColor(0) == Palette.cheap, "Farbe günstig = Türkis")
         check(close(priceColor(1), Palette.veryExpensive), "Farbe teuer = Rot")
         check(!close(priceColor(0.2), priceColor(0.9)), "günstig und teuer unterscheidbar")
@@ -1213,7 +1206,7 @@ enum Main {
             exit(0)
         }
         if let i = args.firstIndex(of: "--set-token"), i + 1 < args.count {
-            Keychain.save(args[i + 1])
+            TokenStore.save(args[i + 1])
             print("Token in Keychain gespeichert.")
             exit(0)
         }

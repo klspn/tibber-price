@@ -17,7 +17,9 @@ Beim ersten Start Token einfügen (developer.tibber.com → Token). Der Token li
 
 ## Funktionen
 
-- Menüleiste: aktueller Preis, z. B. `29,5 ct`.
+- Menüleiste: aktueller Preis, z. B. `29,5 ct`. Klick öffnet das Popover,
+  optional schon beim Drüberfahren (Einstellungen).
+- Einstellungen: „Beim Anmelden starten" (SMAppService), „Beim Drüberfahren öffnen".
 - Popover: Ring mit aktuellem Preis und Viertelstunde, Durchschnittspreis des Zeitraums,
   15-Minuten-/60-Minuten-Umschalter, Heute / Morgen / 2 Tage, Flächenchart mit
   Jetzt-Markierung.
@@ -25,8 +27,9 @@ Beim ersten Start Token einfügen (developer.tibber.com → Token). Der Token li
   Fadenkreuz am Preis.
 - Farbe aus der relativen Lage im sichtbaren Zeitraum (türkis = günstig, orange/rot = teuer),
   nicht aus dem `level` der API — das ist bei Viertelstundenwerten inkonsistent.
-- **Touch ID** beim Start; Macs ohne Biometrie fragen das Login-Passwort. Der Token wird
-  einmal pro Start gelesen und danach nur aus dem Speicher benutzt.
+- **Kein Passwort-/Touch-ID-Dialog**: Token liegt in `~/Library/Application Support/TibberPrice/token`
+  mit Rechten `0600` (bewusst Datei statt Keychain — Keychain-Einträge einer ad-hoc signierten
+  App fragen nach jedem Build erneut nach dem Passwort). Wird einmal pro Start gelesen.
 - Cache: `~/Library/Application Support/TibberPrice/cache.json`, wird 6 h genutzt
   (Preise ändern sich nur 1×/Tag, schont das Tibber-Rate-Limit von 100 req/5 min).
 - Aktualisierung: nach jeder Viertelstunde; Netzabruf nur bei veraltetem Cache.
@@ -41,6 +44,4 @@ Beim ersten Start Token einfügen (developer.tibber.com → Token). Der Token li
 
 ## Hinweise
 
-- Neubau (neue Ad-hoc-Signatur) → macOS fragt einmal, ob die App auf den Keychain-Eintrag
-  zugreifen darf. „Immer erlauben" wählen; danach reicht Touch ID.
 - Kein Login-Item, keine Preis-Alarme, keine Notifications.
