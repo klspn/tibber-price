@@ -955,18 +955,21 @@ struct ContentView: View {
             if store.loading {
                 ProgressView().controlSize(.mini)
             } else {
-                Button("Aktualisieren") { Task { await store.refresh() } }
-                    .buttonStyle(.plain)
+                footerAction("Aktualisieren") { Task { await store.refresh() } }
             }
-            Button("Token") { screen = .token }
-                .buttonStyle(.plain)
-            Button("Einstellungen") { screen = .settings }
-                .buttonStyle(.plain)
-            Button("Beenden") { NSApp.terminate(nil) }
-                .buttonStyle(.plain)
+            footerAction("Token") { screen = .token }
+            footerAction("Einstellungen") { screen = .settings }
+            footerAction("Beenden") { NSApp.terminate(nil) }
         }
         .font(.system(size: 10))
         .foregroundStyle(Palette.dim)
+    }
+
+    // Text statt Button: keine Focus-Ringe/Button-Chrome im Popover.
+    private func footerAction(_ title: String, _ action: @escaping () -> Void) -> some View {
+        Text(title)
+            .contentShape(Rectangle())
+            .onTapGesture(perform: action)
     }
 }
 
