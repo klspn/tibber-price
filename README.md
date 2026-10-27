@@ -13,7 +13,7 @@ Datenquelle: Tibber GraphQL `https://api.tibber.com/v1-beta/gql`,
 ```
 
 Baut `TibberPrice.app` (ad-hoc signiert) und startet sie. Kein Xcode-Projekt, keine Dependencies.
-Beim ersten Start Token einfügen (developer.tibber.com → Token). Der Token liegt nur in der Keychain.
+Beim ersten Start Token einfügen (developer.tibber.com → Token).
 
 ## Funktionen
 
